@@ -18,6 +18,8 @@ const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4
 const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
 const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
 const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+const LEN_BUCKET_END = [];
+for (let li = 0; li < 29; li++) LEN_BUCKET_END.push(li < 28 ? LEN_BASE[li + 1] - 1 : 258);
 
 const LEN_CODE = new Array(259).fill(0);
 const LEN_EXT = new Array(259).fill(0);
@@ -614,7 +616,7 @@ function matchLengthAt(data, i, p, maxLen) {
 // hash, cap 32, consulted only when A found a match shorter than 64.
 function findMatches(data) {
   const n = data.length;
-  const chainCap = n > 2000000 ? 32 : n > 800000 ? 64 : 128;
+  const chainCap = n > 800000 ? 1024 : 512;
   const longestLen = new Uint16Array(n);
   const longestDist = new Int32Array(n);
   const closestLen = new Uint16Array(n);
@@ -637,6 +639,8 @@ function findMatches(data) {
       steps++;
       const dist = i - p;
       if (dist > 32768) break;
+      if (bestLen >= maxLen) break;
+      if (bestLen > 0 && data[p + bestLen] !== data[i + bestLen]) { p = prevA[p]; continue; }
       const len = matchLengthAt(data, i, p, maxLen);
       if (len >= 3) {
         if (len > bestLen || (len === bestLen && dist < bestDist)) { bestLen = len; bestDist = dist; }
@@ -658,6 +662,8 @@ function findMatches(data) {
           bsteps++;
           const dist = i - q;
           if (dist > 32768) break;
+          if (bestLen >= maxLen) break;
+          if (bestLen > 0 && data[q + bestLen] !== data[i + bestLen]) { q = prevB[q]; continue; }
           const len = matchLengthAt(data, i, q, maxLen);
           if (len >= 3) {
             if (len > bestLen || (len === bestLen && dist < bestDist)) { bestLen = len; bestDist = dist; }
@@ -718,6 +724,11 @@ function greedyFreqs(data, start, end, matches) {
 // literal, the longest match and the closest match (lengths clamped to the
 // block end), priced with the given Huffman lengths.
 function dpParse(data, start, end, matches, litLens, distLens) {
+  const lenCost = new Array(29);
+  for (let li = 0; li < 29; li++) {
+    const l = litLens[257 + li];
+    lenCost[li] = l === 0 ? Infinity : l + LEN_EXTRA[li];
+  }
   const n = end - start;
   const cost = new Float64Array(n + 1);
   for (let i = 0; i <= n; i++) cost[i] = Infinity;
@@ -735,26 +746,51 @@ function dpParse(data, start, end, matches, litLens, distLens) {
       choice[i + 1] = 0;
       choiceLen[i + 1] = 1;
     }
-    const ll = Math.min(matches.longestLen[pos], n - i);
-    if (ll >= 3) {
-      const c = base + matchCost(ll, matches.longestDist[pos], litLens, distLens);
-      if (c < cost[i + ll]) {
-        cost[i + ll] = c;
-        choice[i + ll] = 1;
-        choiceLen[i + ll] = ll;
-        choiceDist[i + ll] = matches.longestDist[pos];
+    // Try every length-code bucket end (plus the max length itself) for both
+    // the longest and the closest match: a shorter match can land on a far
+    // better position, and a length just below a code boundary can be cheaper.
+    // Length-code costs are precomputed per bucket; the distance cost is
+    // computed once per match, not once per candidate length.
+    const tryMatch = (maxLen, dist, ch) => {
+      if (maxLen < 3 || dist <= 0) return;
+      const dc = distLens[DIST_CODE[dist]];
+      if (dc === 0) return;
+      const distCost = dc + DIST_EXT[dist];
+      let prevEnd = -1;
+      for (let li = 0; li < 29; li++) {
+        const bend = LEN_BUCKET_END[li];
+        if (bend > maxLen) break;
+        if (bend < 3) continue;
+        const lc = lenCost[li];
+        if (lc === Infinity) continue;
+        const c = base + lc + distCost;
+        if (c < cost[i + bend]) {
+          cost[i + bend] = c;
+          choice[i + bend] = ch;
+          choiceLen[i + bend] = bend;
+          choiceDist[i + bend] = dist;
+        }
+        prevEnd = bend;
       }
-    }
-    const cl = Math.min(matches.closestLen[pos], n - i);
-    if (cl >= 3) {
-      const c = base + matchCost(cl, matches.closestDist[pos], litLens, distLens);
-      if (c < cost[i + cl]) {
-        cost[i + cl] = c;
-        choice[i + cl] = 2;
-        choiceLen[i + cl] = cl;
-        choiceDist[i + cl] = matches.closestDist[pos];
+      if (maxLen !== prevEnd) {
+        const lc = lenCost[LEN_CODE[maxLen]];
+        if (lc !== Infinity) {
+          const c = base + lc + distCost;
+          if (c < cost[i + maxLen]) {
+            cost[i + maxLen] = c;
+            choice[i + maxLen] = ch;
+            choiceLen[i + maxLen] = maxLen;
+            choiceDist[i + maxLen] = dist;
+          }
+        }
       }
-    }
+    };
+    const ll2 = Math.min(matches.longestLen[pos], n - i);
+    const ld2 = matches.longestDist[pos];
+    const cl2 = Math.min(matches.closestLen[pos], n - i);
+    const cd2 = matches.closestDist[pos];
+    tryMatch(ll2, ld2, 1);
+    if (cl2 !== ll2 || cd2 !== ld2) tryMatch(cl2, cd2, 2);
   }
   const ops = [];
   let i = n;
